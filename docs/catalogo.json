@@ -523,11 +523,20 @@
     },
     {
         "Id":  "perf-activate",
-        "Name":  "Activar con licencia OEM",
-        "Desc":  "Recupera la clave grabada en el BIOS y reactiva Windows con ella",
+        "Name":  "Activar Windows",
+        "Desc":  "Reactiva la licencia digital, prueba la clave OEM del BIOS y diagnostica por que falla",
         "Cat":  "perf",
         "Risk":  "care",
         "Run":  "inline",
+        "Reversible":  false
+    },
+    {
+        "Id":  "perf-activate-kms",
+        "Name":  "Activar contra un KMS corporativo",
+        "Desc":  "Para empresas con licencia por volumen y su propio servidor KMS en la red",
+        "Cat":  "perf",
+        "Risk":  "care",
+        "Run":  "term",
         "Reversible":  false
     },
     {

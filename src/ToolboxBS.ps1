@@ -1649,28 +1649,197 @@ try {
 '@
 
     T -Id 'perf-activate' -Cat 'perf' -Icon 'E8D7' -Risk 'care' -Run 'inline' `
-        -Name 'Activar con licencia OEM' -Desc 'Recupera la clave grabada en el BIOS y reactiva Windows con ella' -Code @'
-HR "ACTIVACION CON CLAVE OEM"
-Step "Estado actual"
-$lic = Get-CimInstance SoftwareLicensingProduct -Filter "PartialProductKey IS NOT NULL AND Name LIKE 'Windows%'" -ErrorAction SilentlyContinue
-foreach ($l in $lic) {
-    $estado = switch ($l.LicenseStatus) { 0 {"Sin licencia"} 1 {"ACTIVADO"} 2 {"Periodo de gracia"} 3 {"Gracia extra"} 4 {"Gracia por no genuino"} 5 {"Notificacion"} default {"Desconocido"} }
-    ROW $l.Name $estado
-    ROW "  Canal" $l.ProductKeyChannel
+        -Name 'Activar Windows' -Desc 'Reactiva la licencia digital, prueba la clave OEM del BIOS y diagnostica por que falla' -Code @'
+HR "ACTIVACION DE WINDOWS"
+
+# La version anterior solo probaba la clave OEM del BIOS y, si no la habia, se
+# rendia. Eso dejaba fuera el caso mas comun tras un formateo: el equipo tiene
+# licencia digital ligada al hardware y solo hay que reactivarla. Ahora se
+# intentan las tres vias en orden y se para en cuanto una funciona.
+
+# OJO: no llamar al parametro $Args, que es variable automatica de PowerShell
+# y rompe el splatting (slmgr recibia los argumentos mal y devolvia
+# "Invalid combination of command parameters").
+function Slmgr { param([string[]]$Opciones) cscript.exe //nologo "$env:SystemRoot\System32\slmgr.vbs" @Opciones }
+
+function Estado-Licencia {
+    $l = Get-CimInstance SoftwareLicensingProduct -ErrorAction SilentlyContinue |
+        Where-Object { $_.PartialProductKey -and $_.Name -like "Windows*" } | Select-Object -First 1
+    return $l
 }
-Step "Clave OEM del firmware"
-$key = (Get-CimInstance SoftwareLicensingService -ErrorAction SilentlyContinue).OA3xOriginalProductKey
-if (-not $key) {
-    WARN "Este equipo no tiene clave OEM grabada en el BIOS (habitual en equipos ensamblados o con licencia por cuenta Microsoft)."
+
+function Activado {
+    $l = Estado-Licencia
+    return ($l -and $l.LicenseStatus -eq 1)
+}
+
+Step "Estado actual"
+$cv = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -ErrorAction SilentlyContinue
+ROW "Edicion" "$($cv.ProductName)  $($cv.DisplayVersion)"
+$lic = Estado-Licencia
+if ($lic) {
+    $estado = switch ($lic.LicenseStatus) {
+        0 { "Sin licencia" } 1 { "ACTIVADO" } 2 { "Periodo de gracia" } 3 { "Gracia extra" }
+        4 { "Gracia por no genuino" } 5 { "Notificacion (no activado)" } 6 { "Gracia extendida" }
+        default { "Desconocido ($($lic.LicenseStatus))" }
+    }
+    ROW "Estado" $estado
+    ROW "Canal" $lic.ProductKeyChannel
+    ROW "Clave parcial" $lic.PartialProductKey
+    if ($lic.GracePeriodRemaining -gt 0) { ROW "Gracia restante" "$([math]::Round($lic.GracePeriodRemaining / 1440)) dias" }
+    if ($lic.LicenseStatusReason) { ROW "Codigo" ("0x" + [Convert]::ToString($lic.LicenseStatusReason, 16)) }
+}
+else { WARN "No se encontro ningun producto Windows con clave instalada." }
+
+if (Activado) { OK "Windows ya esta activado. No hay nada que hacer."; Step "Detalle"; Slmgr /xpr; return }
+
+Step "Servicio de licencias (sppsvc)"
+$spp = Get-Service sppsvc -ErrorAction SilentlyContinue
+if ($spp) {
+    ROW "Estado" $spp.Status
+    if ($spp.Status -ne "Running") {
+        WARN "Estaba parado, se inicia: sin el no se puede activar."
+        try { Set-Service sppsvc -StartupType Automatic -ErrorAction SilentlyContinue; Start-Service sppsvc -ErrorAction Stop; OK "Iniciado." }
+        catch { ERR "No se pudo iniciar: $($_.Exception.Message)" }
+    }
+}
+
+Step "Licencia digital ligada al hardware"
+$hw = (Get-CimInstance SoftwareLicensingService -ErrorAction SilentlyContinue)
+if ($hw.ClientMachineID) { ROW "Id de equipo (CMID)" $hw.ClientMachineID }
+INFO "Si este equipo se activo antes con esta misma placa, Microsoft guarda el derecho y basta con reactivar."
+
+# -- Via 1: reactivar la licencia que el equipo ya tiene --
+Step "Via 1: reactivar la licencia existente"
+Slmgr /ato
+Start-Sleep -Seconds 4
+if (Activado) { OK "Activado con la licencia que ya tenia el equipo."; Slmgr /xpr; return }
+INFO "No basto con reactivar; se sigue."
+
+# -- Via 2: clave OEM grabada en el firmware --
+Step "Via 2: clave OEM del firmware (BIOS)"
+$key = $hw.OA3xOriginalProductKey
+if ($key) {
+    OK "Clave OEM encontrada: $key"
+    Slmgr /ipk $key
+    Start-Sleep -Seconds 3
+    Slmgr /ato
+    Start-Sleep -Seconds 4
+    if (Activado) { OK "Activado con la clave OEM del BIOS."; Slmgr /xpr; return }
+    WARN "La clave OEM se instalo pero la activacion no cuajo."
+}
+else { INFO "Este equipo no tiene clave OEM en el BIOS (normal en ensamblados y en equipos con licencia digital)." }
+
+# -- Via 3: diagnostico oficial de Microsoft --
+Step "Via 3: diagnostico de licencias de Microsoft"
+$diag = "$env:SystemRoot\System32\licensingdiag.exe"
+if (Test-Path $diag) {
+    $out = Join-Path (BSDir "reportes") ("licencias_" + (Stamp) + ".xml")
+    & $diag -report $out -log (Join-Path (BSDir "reportes") ("licencias_" + (Stamp) + ".cab")) | Out-Null
+    if (Test-Path $out) { OK "Informe de licencias: $out" }
+}
+
+Step "Que hacer ahora"
+WARN "Windows sigue sin activar. Segun el caso:"
+INFO "  - Si el equipo trae pegatina o licencia comprada: introduce la clave en la ventana que se abre."
+INFO "  - Si ya estuvo activado en esta placa: usa el Solucionador de problemas de activacion,"
+INFO "    que reclama la licencia digital ligada a la cuenta Microsoft o al hardware."
+INFO "  - Si cambiaste placa base: hay que reclamar la licencia con la cuenta Microsoft asociada."
+INFO "  - En empresa con licencia por volumen: usa la herramienta 'Activar contra un KMS corporativo'."
+
+Start-Process "ms-settings:activation"
+Start-Process "slui.exe" -ArgumentList "3" -ErrorAction SilentlyContinue
+'@
+
+    T -Id 'perf-activate-kms' -Cat 'perf' -Icon 'E8D7' -Risk 'care' -Run 'term' `
+        -Name 'Activar contra un KMS corporativo' -Desc 'Para empresas con licencia por volumen y su propio servidor KMS en la red' -Code @'
+HR "ACTIVACION POR KMS CORPORATIVO"
+
+INFO "Esto es para organizaciones que tienen contrato de licencia por volumen"
+INFO "con Microsoft y su propio host KMS en la red. Necesitas la direccion de"
+INFO "ese servidor: preguntasela a quien administre las licencias."
+Write-Host ""
+WARN "No sirve para activar Windows sin licencia. Las GVLK solo funcionan"
+WARN "contra un KMS autorizado de tu organizacion."
+Write-Host ""
+
+# OJO: no llamar al parametro $Args, que es variable automatica de PowerShell
+# y rompe el splatting (slmgr recibia los argumentos mal y devolvia
+# "Invalid combination of command parameters").
+function Slmgr { param([string[]]$Opciones) cscript.exe //nologo "$env:SystemRoot\System32\slmgr.vbs" @Opciones }
+
+Step "Edicion instalada"
+$cv = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -ErrorAction SilentlyContinue
+$edicion = $cv.EditionID
+ROW "Producto" $cv.ProductName
+ROW "EditionID" $edicion
+
+# Claves GVLK publicadas por Microsoft para activacion por volumen.
+# No activan nada por si solas: solo dicen al equipo contra que KMS hablar.
+$gvlk = @{
+    "Professional"           = "W269N-WFGWX-YVC9B-4J6C9-T83GX"
+    "ProfessionalWorkstation" = "NRG8B-VKK3Q-CXVCJ-9G2XF-6Q84J"
+    "ProfessionalEducation"  = "6TP4R-GNPTD-KYYHQ-7B7DP-J447Y"
+    "Enterprise"             = "NPPR9-FWDCX-D2C8J-H872K-2YT43"
+    "EnterpriseS"            = "M7XTQ-FN8P6-TTKYV-9D4CC-J462D"
+    "Education"              = "NW6C2-QMPVW-D7KKK-3GKT6-VCFB2"
+    "ServerStandard"         = "N69G4-B89J2-4G8F4-WWYCC-J464C"
+    "ServerDatacenter"       = "WMDGN-G9PQG-XVVXX-R3X43-63DFG"
+}
+
+$clave = $gvlk[$edicion]
+if (-not $clave) {
+    ERR "No tengo la GVLK para la edicion '$edicion'."
+    INFO "Consulta la lista oficial de Microsoft: busca 'KMS client setup keys'."
+    Read-Host "ENTER para salir" | Out-Null
     return
 }
-OK "Clave encontrada: $key"
-Step "Instalando y activando"
-cscript.exe //nologo "$env:SystemRoot\System32\slmgr.vbs" /ipk $key
+OK "GVLK para $edicion : $clave"
+
+Write-Host ""
+$host_kms = Read-Host "Direccion del servidor KMS de tu organizacion (vacio = cancelar)"
+if (-not $host_kms) { WARN "Cancelado."; return }
+
+$host_kms = $host_kms.Trim()
+Step "Comprobando que el servidor responde"
+$puerto = 1688
+if ($host_kms -match "^(.+):(\d+)$") { $host_kms = $Matches[1]; $puerto = [int]$Matches[2] }
+$prueba = Test-NetConnection -ComputerName $host_kms -Port $puerto -WarningAction SilentlyContinue
+if ($prueba.TcpTestSucceeded) { OK "$host_kms responde en el puerto $puerto." }
+else {
+    ERR "No responde en $host_kms`:$puerto."
+    WARN "Si no es alcanzable, la activacion fallara. Revisa la direccion, la VPN o el firewall."
+    $seguir = Read-Host "Intentar de todas formas? (s/N)"
+    if ($seguir -notmatch "^[sS]") { return }
+}
+
+Step "Instalando la GVLK"
+Slmgr /ipk $clave
 Start-Sleep -Seconds 3
-cscript.exe //nologo "$env:SystemRoot\System32\slmgr.vbs" /ato
-Start-Sleep -Seconds 3
-cscript.exe //nologo "$env:SystemRoot\System32\slmgr.vbs" /xpr
+
+Step "Apuntando al KMS de la organizacion"
+Slmgr /skms "$host_kms`:$puerto"
+Start-Sleep -Seconds 2
+
+Step "Activando"
+Slmgr /ato
+Start-Sleep -Seconds 4
+
+Step "Resultado"
+Slmgr /xpr
+$lic = Get-CimInstance SoftwareLicensingProduct -ErrorAction SilentlyContinue |
+    Where-Object { $_.PartialProductKey -and $_.Name -like "Windows*" } | Select-Object -First 1
+if ($lic.LicenseStatus -eq 1) {
+    OK "Activado contra $host_kms."
+    INFO "La activacion por KMS caduca a los 180 dias y se renueva sola mientras el equipo vea el servidor."
+}
+else {
+    ERR "No se activo. Codigo: $($lic.LicenseStatusReason)"
+    INFO "Causas habituales: el KMS no tiene suficientes equipos registrados (necesita 25 para clientes),"
+    INFO "el equipo no alcanza el servidor, o la edicion no coincide con la licencia contratada."
+}
+Write-Host ""
+Read-Host "ENTER para cerrar" | Out-Null
 '@
 
     T -Id 'perf-reboot-bios' -Cat 'perf' -Icon 'E7E8' -Risk 'danger' -Run 'inline' `
@@ -4146,7 +4315,7 @@ $Global:Recetas = @(
     [pscustomobject]@{
         Nombre = 'Recien formateado'; Icon = 'E90F'; Color = 'AccentBlue'
         Desc   = 'Winget, debloat, tweaks base'
-        Ids    = @('repair-restore-point', 'perf-install-winget', 'perf-explorer-tweaks', 'perf-context', 'perf-widgets', 'perf-bloat', 'perf-bing-search', 'perf-notifications', 'tools-clipboard', 'tools-context-menu', 'perf-ultimate', 'repair-time')
+        Ids    = @('repair-restore-point', 'perf-activate', 'perf-install-winget', 'perf-explorer-tweaks', 'perf-context', 'perf-widgets', 'perf-bloat', 'perf-bing-search', 'perf-notifications', 'tools-clipboard', 'tools-context-menu', 'perf-ultimate', 'repair-time')
     }
     [pscustomobject]@{
         Nombre = 'Revision de seguridad'; Icon = 'EA18'; Color = 'AccentPurple'
@@ -5147,7 +5316,13 @@ function Next-BSTask {
             Emit "[OK] Ventana lanzada." 'ok'
         }
         catch { Emit "[X] No se pudo abrir la ventana: $($_.Exception.Message)" 'err' }
-        $window.Dispatcher.BeginInvoke([Action] { Next-BSTask }, 'Background') | Out-Null
+        # OJO con el orden de los argumentos: BeginInvoke([Action]{...}, 'Background')
+        # se enlaza con la sobrecarga BeginInvoke(Delegate, params object[] args),
+        # asi que 'Background' se pasaria COMO ARGUMENTO al delegado. Como el
+        # Action no recibe parametros, lanza "Parameter count mismatch" desde el
+        # hilo del dispatcher y tumba ShowDialog(), es decir, la aplicacion entera.
+        # Con la prioridad primero la sobrecarga es inequivoca.
+        $window.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Background, [Action] { Next-BSTask }) | Out-Null
         return
     }
 
@@ -5166,7 +5341,13 @@ function Next-BSTask {
     catch {
         Emit "[X] No se pudo iniciar la tarea: $($_.Exception.Message)" 'err'
         $Global:Proc = $null
-        $window.Dispatcher.BeginInvoke([Action] { Next-BSTask }, 'Background') | Out-Null
+        # OJO con el orden de los argumentos: BeginInvoke([Action]{...}, 'Background')
+        # se enlaza con la sobrecarga BeginInvoke(Delegate, params object[] args),
+        # asi que 'Background' se pasaria COMO ARGUMENTO al delegado. Como el
+        # Action no recibe parametros, lanza "Parameter count mismatch" desde el
+        # hilo del dispatcher y tumba ShowDialog(), es decir, la aplicacion entera.
+        # Con la prioridad primero la sobrecarga es inequivoca.
+        $window.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Background, [Action] { Next-BSTask }) | Out-Null
     }
 }
 
@@ -5791,6 +5972,27 @@ if ($SelfTest) {
     if ([int]$TxtCounter.Text -ne $r.Ids.Count) { $fallos += "la rutina '$($r.Nombre)' selecciono $($TxtCounter.Text) de $($r.Ids.Count)" }
     foreach ($c in $Global:Cards) { $c.IsChecked = $false }
     Update-Counter
+
+    # El motor encadena tareas saltando por el dispatcher. Si la sobrecarga de
+    # BeginInvoke es la equivocada, el delegado recibe un argumento de mas y
+    # lanza "Parameter count mismatch" desde el hilo de la interfaz, lo que
+    # tumba ShowDialog() y con el la aplicacion entera. Solo pasaba al ejecutar
+    # una herramienta de ventana propia, asi que se comprueba aqui de forma
+    # explicita en vez de descubrirlo en un equipo del cliente.
+    $script:saltoDispatcher = $false
+    try {
+        $window.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Background,
+            [Action] { $script:saltoDispatcher = $true }) | Out-Null
+        $window.Dispatcher.Invoke([Action] { }, [System.Windows.Threading.DispatcherPriority]::ApplicationIdle)
+    }
+    catch { $fallos += "el salto por el dispatcher lanzo: $($_.Exception.Message)" }
+    if (-not $script:saltoDispatcher) { $fallos += "el encadenado de tareas por el dispatcher no ejecuto el delegado" }
+
+    # Y que toda herramienta de ventana propia tenga codigo utilizable
+    $term = @($Global:Catalog | Where-Object Run -eq 'term')
+    foreach ($t in $term) {
+        if (-not $t.Code -or $t.Code.Trim().Length -lt 10) { $fallos += "la herramienta de ventana '$($t.Id)' no tiene codigo" }
+    }
 
     if ($fallos) {
         Write-Host "[selftest] FALLOS FUNCIONALES:" -ForegroundColor Red
